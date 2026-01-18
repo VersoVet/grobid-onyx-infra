@@ -1,7 +1,6 @@
 {
   "name": "grobid-onyx-infra",
-  "version": "1.0.0",
-
+  "version": "1.0.1",
   "core": {
     "display_name": "Grobid PDF Parser",
     "description": "Service d'extraction de metadonnees et texte structure depuis des documents PDF scientifiques via Grobid",
@@ -16,7 +15,6 @@
       "icon": "📄"
     }
   },
-
   "heart": {
     "deployment": {
       "target_host": "10.0.0.21",
@@ -28,7 +26,6 @@
       "restart_policy": "always"
     }
   },
-
   "forge": {
     "type": "python-docker",
     "repository": "VersoVet/grobid-onyx-infra",
@@ -36,8 +33,8 @@
       "dev_platform": "onyxlab",
       "test_platform": "onyxaxon",
       "remote_mount": true,
-      "dev_status": "in_progress",
-      "progress_percent": 80
+      "dev_status": "deployed",
+      "progress_percent": 100
     },
     "python": {
       "src_dir": "src",
@@ -45,7 +42,9 @@
     },
     "docker": {
       "compose_file": "docker/docker-compose.yml",
-      "services": ["grobid"],
+      "services": [
+        "grobid"
+      ],
       "build_mode": "config",
       "base_image": "grobid/grobid:0.8.1"
     }
