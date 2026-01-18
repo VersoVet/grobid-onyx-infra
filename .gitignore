@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config
+config/local.json
+.env
+*.local
+
+# Logs
+*.log
+logs/
+
+# Docker volumes data (local dev only)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
