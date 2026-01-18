@@ -13,17 +13,21 @@ from fastapi.responses import Response
 from contextlib import asynccontextmanager
 from pathlib import Path
 import docker
-import subprocess
 import asyncio
 import httpx
 import uvicorn
+import logging
 import os
 
-# Configuration
-SKILL_NAME = "grobid-onyx-infra"
-BRAIN_AREA = "prefrontal"
-WRAPPER_PORT = 8071  # Port du wrapper Python
-GROBID_PORT = 8070   # Port interne Grobid
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("grobid-onyx-infra")
+
+# Configuration (via env ou defaut)
+SKILL_NAME = os.getenv("SKILL_NAME", "grobid-onyx-infra")
+BRAIN_AREA = os.getenv("BRAIN_AREA", "prefrontal")
+WRAPPER_PORT = int(os.getenv("WRAPPER_PORT", "8071"))
+GROBID_PORT = int(os.getenv("GROBID_PORT", "8070"))
 GROBID_URL = f"http://localhost:{GROBID_PORT}"
 DOCKER_COMPOSE_PATH = Path(__file__).parent.parent / "docker" / "docker-compose.yml"
 
@@ -35,45 +39,76 @@ try:
     from onyx_sdk import OnyxClient
     onyx_client = OnyxClient(SKILL_NAME, BRAIN_AREA, port=WRAPPER_PORT)
     HAS_ONYX_SDK = True
+    logger.info("Onyx SDK charge")
 except ImportError:
     onyx_client = None
     HAS_ONYX_SDK = False
+    logger.info("Onyx SDK non disponible")
 
 
 def set_status(status: str, message: str = ""):
     """Set Onyx status if SDK available."""
     if onyx_client:
-        if status == "working":
-            onyx_client.working(message)
-        elif status == "idle":
-            onyx_client.idle()
-        elif status == "error":
-            onyx_client.error(message)
+        try:
+            if status == "working":
+                onyx_client.working(message)
+            elif status == "idle":
+                onyx_client.idle()
+            elif status == "error":
+                onyx_client.error(message)
+        except Exception as e:
+            logger.warning(f"Erreur SDK Onyx: {e}")
 
 
 async def start_containers():
-    """Demarre les containers Docker via docker-compose."""
+    """Demarre les containers Docker via docker-compose (async)."""
     set_status("working", "Demarrage du conteneur Grobid...")
+    logger.info("Demarrage des containers Docker...")
 
-    result = subprocess.run(
-        ["docker", "compose", "-f", str(DOCKER_COMPOSE_PATH), "up", "-d"],
-        capture_output=True,
-        text=True,
-        cwd=DOCKER_COMPOSE_PATH.parent
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "compose", "-f", str(DOCKER_COMPOSE_PATH), "up", "-d",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=DOCKER_COMPOSE_PATH.parent
+        )
+        stdout, stderr = await proc.communicate()
 
-    if result.returncode != 0:
-        set_status("error", f"Echec demarrage: {result.stderr}")
-        raise RuntimeError(f"Docker compose failed: {result.stderr}")
+        if proc.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            set_status("error", f"Echec demarrage: {error_msg}")
+            logger.error(f"Docker compose failed: {error_msg}")
+            raise RuntimeError(f"Docker compose failed: {error_msg}")
+
+        logger.info("Containers demarres")
+
+    except FileNotFoundError:
+        error_msg = "docker compose non trouve"
+        set_status("error", error_msg)
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
 
 async def stop_containers():
-    """Arrete les containers Docker."""
-    subprocess.run(
-        ["docker", "compose", "-f", str(DOCKER_COMPOSE_PATH), "down"],
-        capture_output=True,
-        cwd=DOCKER_COMPOSE_PATH.parent
-    )
+    """Arrete les containers Docker (async)."""
+    logger.info("Arret des containers Docker...")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "compose", "-f", str(DOCKER_COMPOSE_PATH), "down",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=DOCKER_COMPOSE_PATH.parent
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            logger.warning(f"Docker compose down warning: {stderr.decode() if stderr else ''}")
+        else:
+            logger.info("Containers arretes")
+
+    except Exception as e:
+        logger.warning(f"Erreur arret containers: {e}")
 
 
 def check_containers_health() -> dict:
@@ -97,6 +132,7 @@ def check_containers_health() -> dict:
         return {"healthy": all_healthy, "containers": statuses}
 
     except Exception as e:
+        logger.error(f"Erreur check containers: {e}")
         return {"healthy": False, "containers": {}, "error": str(e)}
 
 
@@ -113,27 +149,34 @@ async def check_grobid_ready() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle: demarre les containers au startup, les arrete au shutdown."""
-    # Startup
-    await start_containers()
+    try:
+        # Startup
+        await start_containers()
 
-    # Attendre que Grobid soit pret (timeout 3 minutes pour chargement des modeles)
-    set_status("working", "Chargement des modeles Grobid...")
-    for i in range(180):
+        # Attendre que Grobid soit pret (timeout 3 minutes pour chargement des modeles)
+        set_status("working", "Chargement des modeles Grobid...")
+        logger.info("Attente chargement modeles Grobid...")
+
+        for i in range(180):
+            if await check_grobid_ready():
+                break
+            await asyncio.sleep(1)
+            if i % 30 == 0 and i > 0:
+                set_status("working", f"Chargement des modeles... ({i}s)")
+                logger.info(f"Chargement modeles: {i}s...")
+
         if await check_grobid_ready():
-            break
-        await asyncio.sleep(1)
-        if i % 30 == 0:
-            set_status("working", f"Chargement des modeles... ({i}s)")
+            set_status("idle")
+            logger.info("Grobid pret")
+        else:
+            set_status("error", "Grobid n'a pas demarre correctement")
+            logger.error("Grobid n'a pas demarre dans le delai imparti")
 
-    if await check_grobid_ready():
-        set_status("idle")
-    else:
-        set_status("error", "Grobid n'a pas demarre correctement")
+        yield
 
-    yield
-
-    # Shutdown
-    await stop_containers()
+    finally:
+        # Shutdown (toujours execute)
+        await stop_containers()
 
 
 # FastAPI app
@@ -148,7 +191,7 @@ app = FastAPI(
 @app.get("/health")
 async def health():
     """Health check unifie (containers + Grobid API)."""
-    container_health = check_containers_health()
+    container_health = await asyncio.to_thread(check_containers_health)
     grobid_ready = await check_grobid_ready()
 
     healthy = container_health["healthy"] and grobid_ready
@@ -169,7 +212,7 @@ async def health():
 @app.get("/status")
 async def status():
     """Statut detaille du service."""
-    container_health = check_containers_health()
+    container_health = await asyncio.to_thread(check_containers_health)
     grobid_ready = await check_grobid_ready()
 
     return {
@@ -212,10 +255,10 @@ async def process_fulltext_document(
 ):
     """
     Traite un document PDF complet et retourne le TEI XML.
-
     Principal endpoint pour l'extraction de texte structure.
     """
     set_status("working", f"Traitement: {input.filename}")
+    logger.info(f"processFulltextDocument: {input.filename}")
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
@@ -236,15 +279,21 @@ async def process_fulltext_document(
             )
 
             set_status("idle")
+            logger.info(f"processFulltextDocument: {input.filename} - {response.status_code}")
             return Response(
                 content=response.content,
                 media_type="application/xml",
                 status_code=response.status_code
             )
 
+    except httpx.TimeoutException:
+        set_status("error", "Timeout")
+        logger.error(f"Timeout: {input.filename}")
+        raise HTTPException(status_code=504, detail="Grobid processing timeout")
     except Exception as e:
-        set_status("error", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        set_status("error", "Erreur traitement")
+        logger.error(f"Erreur: {e}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
 
 @app.post("/api/processHeaderDocument")
@@ -254,6 +303,7 @@ async def process_header_document(
 ):
     """Extrait uniquement les metadonnees d'en-tete (titre, auteurs, abstract)."""
     set_status("working", f"Extraction header: {input.filename}")
+    logger.info(f"processHeaderDocument: {input.filename}")
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -273,9 +323,13 @@ async def process_header_document(
                 status_code=response.status_code
             )
 
+    except httpx.TimeoutException:
+        set_status("error", "Timeout")
+        raise HTTPException(status_code=504, detail="Grobid processing timeout")
     except Exception as e:
-        set_status("error", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        set_status("error", "Erreur traitement")
+        logger.error(f"Erreur processHeaderDocument: {e}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
 
 @app.post("/api/processReferences")
@@ -285,6 +339,7 @@ async def process_references(
 ):
     """Extrait et parse les references bibliographiques."""
     set_status("working", f"Extraction references: {input.filename}")
+    logger.info(f"processReferences: {input.filename}")
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -304,9 +359,13 @@ async def process_references(
                 status_code=response.status_code
             )
 
+    except httpx.TimeoutException:
+        set_status("error", "Timeout")
+        raise HTTPException(status_code=504, detail="Grobid processing timeout")
     except Exception as e:
-        set_status("error", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        set_status("error", "Erreur traitement")
+        logger.error(f"Erreur processReferences: {e}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
 
 @app.post("/api/processCitation")
@@ -334,7 +393,8 @@ async def process_citation(
             )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Erreur processCitation: {e}")
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
 
 # === Endpoints de gestion Docker ===
@@ -343,6 +403,7 @@ async def process_citation(
 async def restart_containers():
     """Redemarre les containers Grobid."""
     set_status("working", "Redemarrage des containers...")
+    logger.info("Redemarrage containers demande")
 
     await stop_containers()
     await asyncio.sleep(2)
@@ -352,10 +413,12 @@ async def restart_containers():
     for _ in range(120):
         if await check_grobid_ready():
             set_status("idle")
+            logger.info("Redemarrage termine, Grobid pret")
             return {"status": "restarted", "grobid_ready": True}
         await asyncio.sleep(1)
 
     set_status("error", "Grobid non pret apres redemarrage")
+    logger.warning("Grobid non pret apres redemarrage")
     return {"status": "restarted", "grobid_ready": False}
 
 
@@ -363,7 +426,8 @@ async def restart_containers():
 async def get_logs(lines: int = 100):
     """Recupere les logs du container Grobid."""
     try:
-        containers = docker_client.containers.list(
+        containers = await asyncio.to_thread(
+            docker_client.containers.list,
             filters={"label": f"onyx.skill={SKILL_NAME}"}
         )
 
@@ -374,7 +438,8 @@ async def get_logs(lines: int = 100):
         return logs
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Erreur get_logs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve logs")
 
 
 if __name__ == "__main__":
