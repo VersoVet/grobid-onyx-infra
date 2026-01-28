@@ -1,13 +1,13 @@
 {
   "name": "grobid-onyx-infra",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "core": {
     "display_name": "Grobid PDF Parser",
-    "description": "Service d'extraction de metadonnees et texte structure depuis des documents PDF scientifiques via Grobid",
+    "description": "Service d'extraction de metadonnees et texte structure depuis des documents PDF scientifiques via Grobid. SSE monitoring disponible via /events. GROBID direct sur port 8070.",
     "brain_area": "prefrontal",
     "routing": {
       "host": "10.0.0.21",
-      "port": 8071,
+      "port": 8072,
       "protocol": "http"
     },
     "dashboard": {

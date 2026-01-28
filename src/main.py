@@ -10,6 +10,7 @@ Ce skill encapsule le conteneur Grobid et fournit:
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
+from sse_starlette.sse import EventSourceResponse
 from contextlib import asynccontextmanager
 from pathlib import Path
 import docker
@@ -18,6 +19,16 @@ import httpx
 import uvicorn
 import logging
 import os
+import time
+import json
+
+from src.events import (
+    event_manager,
+    emit_extraction_start,
+    emit_extraction_success,
+    emit_extraction_failure,
+    emit_container_event
+)
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +37,7 @@ logger = logging.getLogger("grobid-onyx-infra")
 # Configuration (via env ou defaut)
 SKILL_NAME = os.getenv("SKILL_NAME", "grobid-onyx-infra")
 BRAIN_AREA = os.getenv("BRAIN_AREA", "prefrontal")
-WRAPPER_PORT = int(os.getenv("WRAPPER_PORT", "8071"))
+WRAPPER_PORT = int(os.getenv("WRAPPER_PORT", "8072"))  # 8071 est utilisé par GROBID admin
 GROBID_PORT = int(os.getenv("GROBID_PORT", "8070"))
 GROBID_URL = f"http://localhost:{GROBID_PORT}"
 DOCKER_COMPOSE_PATH = Path(__file__).parent.parent / "docker" / "docker-compose.yml"
@@ -61,7 +72,15 @@ def set_status(status: str, message: str = ""):
 
 
 async def start_containers():
-    """Demarre les containers Docker via docker-compose (async)."""
+    """Demarre les containers Docker via docker-compose (async).
+
+    Si GROBID est déjà en cours d'exécution, skip le démarrage.
+    """
+    # Vérifier d'abord si GROBID est déjà prêt
+    if await check_grobid_ready():
+        logger.info("GROBID déjà en cours d'exécution, skip docker-compose")
+        return
+
     set_status("working", "Demarrage du conteneur Grobid...")
     logger.info("Demarrage des containers Docker...")
 
@@ -76,6 +95,10 @@ async def start_containers():
 
         if proc.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
+            # Si c'est juste un conflit de nom de container (GROBID existe déjà), c'est OK
+            if "already in use" in error_msg or "Conflict" in error_msg:
+                logger.info("Container GROBID existe déjà, continuing...")
+                return
             set_status("error", f"Echec demarrage: {error_msg}")
             logger.error(f"Docker compose failed: {error_msg}")
             raise RuntimeError(f"Docker compose failed: {error_msg}")
@@ -182,10 +205,57 @@ async def lifespan(app: FastAPI):
 # FastAPI app
 app = FastAPI(
     title="Grobid Onyx Infrastructure",
-    description="Service d'extraction de metadonnees PDF via Grobid",
-    version="1.0.0",
+    description="Service d'extraction de metadonnees PDF via Grobid avec monitoring SSE",
+    version="1.1.0",
     lifespan=lifespan
 )
+
+
+# === SSE Endpoints ===
+
+@app.get("/events")
+async def sse_events():
+    """Stream temps réel des événements d'extraction via SSE."""
+    async def event_generator():
+        queue = await event_manager.subscribe()
+        try:
+            # Event de connexion
+            yield {
+                "event": "connected",
+                "data": json.dumps({
+                    "type": "connected",
+                    "message": "Connected to grobid-onyx-infra SSE stream",
+                    "subscribers": event_manager.subscriber_count
+                })
+            }
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield {
+                        "event": event["type"],
+                        "data": json.dumps(event)
+                    }
+                except asyncio.TimeoutError:
+                    # Ping keepalive
+                    yield {"event": "ping", "data": "{}"}
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await event_manager.unsubscribe(queue)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/events/history")
+async def events_history(limit: int = 50):
+    """Historique des derniers événements."""
+    return {
+        "events": event_manager.get_history(limit),
+        "total": len(event_manager.history),
+        "limit": limit
+    }
 
 
 @app.get("/health")
@@ -260,9 +330,18 @@ async def process_fulltext_document(
     set_status("working", f"Traitement: {input.filename}")
     logger.info(f"processFulltextDocument: {input.filename}")
 
+    # Lire le contenu et mesurer la taille
+    file_content = await input.read()
+    file_size_kb = len(file_content) // 1024
+
+    # Émettre event de début
+    await emit_extraction_start(input.filename, "processFulltextDocument", file_size_kb)
+
+    start_time = time.time()
+
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
-            files = {"input": (input.filename, await input.read(), input.content_type)}
+            files = {"input": (input.filename, file_content, input.content_type)}
             data = {
                 "consolidateHeader": consolidateHeader,
                 "consolidateCitations": consolidateCitations,
@@ -278,8 +357,20 @@ async def process_fulltext_document(
                 data=data
             )
 
+            latency_ms = (time.time() - start_time) * 1000
+            response_size_kb = len(response.content) // 1024
+
+            # Émettre event de succès
+            await emit_extraction_success(
+                input.filename,
+                "processFulltextDocument",
+                latency_ms,
+                response_size_kb,
+                response.status_code
+            )
+
             set_status("idle")
-            logger.info(f"processFulltextDocument: {input.filename} - {response.status_code}")
+            logger.info(f"processFulltextDocument: {input.filename} - {response.status_code} ({latency_ms:.0f}ms)")
             return Response(
                 content=response.content,
                 media_type="application/xml",
@@ -287,10 +378,14 @@ async def process_fulltext_document(
             )
 
     except httpx.TimeoutException:
+        latency_ms = (time.time() - start_time) * 1000
+        await emit_extraction_failure(input.filename, "processFulltextDocument", "Timeout after 300s", latency_ms)
         set_status("error", "Timeout")
         logger.error(f"Timeout: {input.filename}")
         raise HTTPException(status_code=504, detail="Grobid processing timeout")
     except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await emit_extraction_failure(input.filename, "processFulltextDocument", str(e), latency_ms)
         set_status("error", "Erreur traitement")
         logger.error(f"Erreur: {e}")
         raise HTTPException(status_code=500, detail="Internal processing error")
